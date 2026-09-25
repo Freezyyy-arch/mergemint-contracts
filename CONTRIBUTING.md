@@ -122,6 +122,16 @@ Use one of these prefixes followed by a short kebab-case description:
 
 Examples: `feat/claim-expiry`, `fix/double-claim-guard`, `docs/snapshot-guide`
 
+### GitHub Actions
+
+Every `uses:` in `.github/workflows/` must reference a full 40-character commit SHA, followed by the human-readable version as a comment:
+
+```yaml
+- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+```
+
+Tags can be moved to point at different code; SHAs cannot. Dependabot (`.github/dependabot.yml`, `github-actions` ecosystem) opens weekly PRs that bump both the SHA and the version comment. To look up the SHA for a new action, run `git ls-remote --tags https://github.com/<owner>/<repo>`.
+
 ---
 
 ## Pull Request Process
