@@ -3,6 +3,11 @@ name: Interface Compatibility Check
 on:
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   interface-check:
@@ -18,8 +23,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      - name: Install system dependencies for Stellar CLI
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
+
       - name: Install Stellar CLI
-        run: cargo install stellar-cli
+        run: cargo install stellar-cli --version 23.0.1 --locked
 
       - name: Build contract
         run: cargo build --release --target wasm32v1-none
@@ -29,20 +37,35 @@ jobs:
         continue-on-error: true
 
       - name: Check interface baseline exists
+        id: baseline
         run: |
           if [ ! -f interface-baseline.json ]; then
             echo "Warning: interface-baseline.json not found. Create with: stellar contract inspect ... > interface-baseline.json"
-            exit 0
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Compare interfaces
+        if: steps.baseline.outputs.exists == 'true'
         run: |
           if diff -q interface-baseline.json current-interface.json > /dev/null 2>&1; then
             echo "✓ Interface compatible"
+            echo "✓ Contract interface matches \`interface-baseline.json\`." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "✗ Interface has changed!"
             echo ""
             echo "Changes:"
             diff interface-baseline.json current-interface.json || true
+            {
+              echo "## ✗ Contract interface changed"
+              echo ""
+              echo "The generated interface differs from \`interface-baseline.json\`."
+              echo "Update the baseline intentionally if this change is expected."
+              echo ""
+              echo '```diff'
+              diff interface-baseline.json current-interface.json || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi

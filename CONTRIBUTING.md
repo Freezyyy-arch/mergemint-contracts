@@ -6,6 +6,7 @@ Thank you for your interest in contributing! This guide covers everything you ne
 
 ## Table of Contents
 
+- [Your First Contribution](#your-first-contribution)
 - [Prerequisites](#prerequisites)
 - [Pre-commit Hooks](#pre-commit-hooks)
 - [Development Workflow](#development-workflow)
@@ -14,6 +15,90 @@ Thank you for your interest in contributing! This guide covers everything you ne
 - [Pull Request Process](#pull-request-process)
 - [Test Snapshots](#test-snapshots)
 - [Security Considerations](#security-considerations)
+
+---
+
+## Your First Contribution
+
+New here? This is the shortest path from a fresh clone to a merged pull request. Each step links to the detailed section further down.
+
+### 1. Pick an issue
+
+- Browse issues labelled [`good first issue`](https://github.com/mergemint-mint/mergemint-contracts/labels/good%20first%20issue). These are scoped to a single area and do not require deep knowledge of Soroban.
+- Leave a comment on the issue saying you are picking it up, so two people don't work on the same thing. If you have questions about the approach, ask them in the issue **before** writing code.
+- Docs, test, and SDK issues are the easiest entry points. Contract changes in `src/contract/mutations.rs` touch escrowed funds and get the most careful review.
+
+### 2. Fork, clone, and branch
+
+```bash
+# Fork on GitHub first, then:
+git clone https://github.com/<your-username>/mergemint-contracts.git
+cd mergemint-contracts
+git remote add upstream https://github.com/mergemint-mint/mergemint-contracts.git
+
+# Always branch from an up-to-date main
+git fetch upstream
+git checkout -b docs/first-issue-guide upstream/main
+```
+
+Name the branch using the [prefixes below](#branch-naming) (`feat/`, `fix/`, `docs/`, `test/`, `refactor/`, `ci/`).
+
+### 3. Set up your toolchain
+
+Install the [prerequisites](#prerequisites). `rust-toolchain.toml` pins the exact Rust version and the `wasm32v1-none` target, so `rustup` installs them automatically the first time you run `cargo` inside the repo.
+
+### 4. Confirm the baseline is green
+
+Before changing anything, check that the existing suite passes on your machine. If it doesn't, the problem is your setup, not your change. See [docs/contributor-faq.md](docs/contributor-faq.md#troubleshooting) for common fixes.
+
+| Area you are changing          | Directory            | Command(s) to run                                                   |
+| ------------------------------ | -------------------- | ------------------------------------------------------------------- |
+| Smart contract (Rust)          | repo root (`src/`)   | `cargo test`, `cargo fmt --check`, `cargo clippy -- -D warnings`    |
+| Contract WASM build            | repo root            | `cargo build --release --target wasm32v1-none`                      |
+| Backend (Rust)                 | `mergemint-backend/` | `cargo test --all-features`, `cargo clippy --all-targets -- -D warnings` |
+| TypeScript SDK                 | `sdk/`               | `npm install`, `npm run typecheck`, `npm test`                      |
+| Frontend (React + Vite)        | `frontend/`          | `npm install`, `npx tsc --noEmit`, `npm test`                       |
+| Frontend components (visual)   | `frontend/`          | `npm run storybook` (component catalog on http://localhost:6006)    |
+| Docs only                      | `docs/`, `*.md`      | Preview the Markdown and check that every link and command works    |
+
+`make test` and `make lint` wrap the contract commands.
+
+### 5. Make the change
+
+- Keep the change focused on the issue. Unrelated cleanups belong in a separate PR.
+- Add or update tests alongside code changes. Contract tests live in `src/test.rs` and `src/contract/queries_test.rs`.
+- If you change a `#[contracttype]` struct, read [Test Snapshots](#test-snapshots) and [docs/migration.md](docs/migration.md) first.
+- If you change the public contract interface, add a [`CHANGELOG.md`](#changelog) entry.
+
+### 6. Commit
+
+Use [Conventional Commits](https://www.conventionalcommits.org/) style messages, matching the history of this repo:
+
+```
+docs: add good first issue guide
+fix(contract): reject zero-share assignees in complete_bounty
+feat(sdk): add getOpenBountiesPage helper
+```
+
+Run `cargo fmt` (and the relevant commands from the table above) before every commit.
+
+### 7. Open the pull request
+
+Push your branch to your fork and open a PR against `mergemint-mint/mergemint-contracts:main`. The PR template will ask for the items below. A PR that includes all of them is usually reviewed on the first pass.
+
+**What a good PR looks like:**
+
+- [ ] A title in Conventional Commit style (`docs: …`, `fix: …`, `feat: …`)
+- [ ] `Closes #<issue-number>` in the description
+- [ ] A short explanation of **what** changed and **why**, plus any trade-offs
+- [ ] Pasted output of the test command(s) for the area you touched
+- [ ] Screenshots for anything visual (frontend changes, Storybook stories)
+- [ ] One logical change; small diffs get reviewed faster than large ones
+- [ ] All [required CI checks](#ci--required-status-checks) green
+
+### 8. Respond to review
+
+A maintainer will review your PR. Push follow-up commits to the same branch to address comments; don't force-push over a review in progress unless asked. Once approved and green, a maintainer merges it. That's your first merged PR.
 
 ---
 
@@ -40,10 +125,10 @@ This is required to build the contract for Soroban deployment.
 ### 3. Stellar CLI
 
 ```bash
-cargo install stellar-cli
+cargo install stellar-cli --version 23.0.1 --locked
 ```
 
-Verify with `stellar --version`. Used for building, deploying, and inspecting contracts.
+Verify with `stellar --version`. Used for building, deploying, and inspecting contracts. CI pins this exact version in `interface-check.yml` so `stellar contract inspect` output stays stable across runs — install the same version locally to avoid false-positive interface diffs.
 
 ### 4. Node.js 20+ (for JS/TS subprojects and the pre-commit hook)
 
@@ -303,6 +388,31 @@ one of the standard categories: `Added`, `Changed`, `Deprecated`, `Removed`,
 `Fixed`, or `Security`.
 
 ## Code Style
+
+---
+
+## CI & Required Status Checks
+
+All of the following GitHub Actions workflows must pass before a pull request can be merged to `main`:
+
+| Workflow file             | Status check name               | Required |
+| ------------------------- | ------------------------------- | -------- |
+| `interface-check.yml`     | Interface Compatibility Check   | ✅ Yes   |
+| `ci.yml` (Backend CI)     | Backend CI                      | ✅ Yes   |
+| `lint.yml`                | Lint                            | ✅ Yes   |
+| `security.yml`            | Security Audit (`cargo-audit`)  | ✅ Yes   |
+| `frontend-ci.yml`         | Frontend CI                     | ✅ Yes   |
+
+> **`interface-check.yml` is the critical gate.** It detects breaking changes to the public contract interface by comparing the current ABI against the last recorded snapshot. A failure here means a public function signature, parameter type, or event payload has changed in a backwards-incompatible way. This check **must pass** before merging to `main`.
+
+### Configuring branch protection rules
+
+If the required status checks are not yet enforced on `main`, set them up via **Settings → Branches → Branch protection rules** for the `main` branch:
+
+1. Enable **Require status checks to pass before merging**.
+2. Search for and add each status check name from the table above.
+3. Enable **Require branches to be up to date before merging** to prevent stale-branch bypasses.
+4. Save the rule.
 
 ---
 

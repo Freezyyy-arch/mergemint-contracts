@@ -1,40 +1,98 @@
 # Contract Architecture
 
+## Two Contract Codebases: Soroban (Rust) vs. Solidity
+
+This repository contains contract code for **two different chains**. A new
+contributor browsing the tree will find both `src/contract/` (Rust) and
+`contracts/bounty/` (Solidity) and could reasonably assume only one is
+actually live. This section clarifies the relationship and current status
+of each.
+
+| | `src/contract/` | `contracts/bounty/` |
+|---|---|---|
+| Language | Rust (`#[contracttype]`, `#[contractimpl]`) | Solidity `^0.8.0` |
+| Target chain | Stellar, via the Soroban VM | EVM-compatible chains |
+| Role | **Primary contract.** Owns bounty creation, claiming, completion, cancellation, and expiry — the full lifecycle documented below. | Standalone batch-refresh utility (`BountyRefresh.sol`) that calls out to an external `IBountyManager` to bulk-update contributor metrics. It does not create, claim, or pay out bounties itself. |
+| Status | **Live / actively developed.** This is the contract MergeMint deploys and the one the rest of this document (data flow, state machine, storage/TTL) describes. | **Not deployed.** No `hardhat.config.*` exists in this repo yet, and `IBountyManager` has no production implementation — only the `MockBountyManager` test double under `test/bounty/mocks/`. Treat it as an EVM-side prototype/utility contract, exercised solely by its own Hardhat test suite (`test/bounty/BountyRefresh.test.js`). |
+| Build/test tooling | `cargo build` / `cargo test` (see [CONTRIBUTING.md](../CONTRIBUTING.md)) | `npx hardhat test` |
+
+**Why both exist:** MergeMint's production bounty logic lives on Stellar
+via Soroban (`src/contract/`). The Solidity code under `contracts/bounty/`
+was added to explore a companion, permissioned batch-refresh mechanism for
+a possible future EVM-side integration (e.g. syncing contributor metrics
+into an EVM-based `IBountyManager`). It is intentionally decoupled from the
+Soroban contract — the two do not call each other and do not share state.
+
+If you're modifying bounty *lifecycle* behavior (create/claim/complete/
+cancel/expire), you want `src/contract/`. If you're modifying the
+EVM-side batch refresh mechanism or its mock/test harness, you want
+`contracts/bounty/` and `test/bounty/`.
+
+---
+
+## Module Layout
+
+`MergeMintContract` lives in `src/contract/` as a directory module rather than a
+single file. `mod.rs` declares the `#[contract]` struct and pulls the other
+files in via `include!`, so all three still compile as one `impl` block:
+
+```
+src/contract/
+├── mod.rs           — contract struct definition; include!()s the files below
+├── mutations.rs      — state-changing entry points (create_bounty, claim_bounty,
+│                       complete_milestone, complete_bounty, approve_completion,
+│                       raise_dispute, resolve_dispute, update_contributor_metadata,
+│                       cancel_bounty, expire_bounty)
+├── queries.rs         — read-only entry points (get_bounty, get_contributor,
+│                       get_bounty_count, get_bounties_by_status, get_status_count,
+│                       get_open_bounties, get_bounties_by_tag,
+│                       get_contributor_active_bounty, get_bounties_by_creator, ...)
+│                       plus the shared `paginate()` helper
+└── queries_test.rs    — unit tests for the query helpers (`mod tests`)
+```
+
 ## Data Flow
 
 ```
 User (Frontend)
     │
     ▼
-MergeMintContract
+MergeMintContract (src/contract/mod.rs)
     │
-    ├── create_bounty()
-    │   ├── Validates creator auth
-    │   ├── Stores bounty in persistent storage
-    │   └── Emits bounty_created event
+    ├── mutations.rs
+    │   ├── create_bounty()
+    │   │   ├── Validates creator auth
+    │   │   ├── Stores bounty in persistent storage
+    │   │   └── Emits bounty_created event
+    │   │
+    │   ├── claim_bounty()
+    │   │   ├── Validates contributor auth
+    │   │   ├── Assigns contributor to bounty
+    │   │   └── Emits bounty_claimed event
+    │   │
+    │   ├── complete_bounty()
+    │   │   ├── Validates verifier auth
+    │   │   ├── Transfers tokens via TokenClient
+    │   │   ├── Updates contributor reputation
+    │   │   ├── Emits bounty_completed event
+    │   │   └── Emits reward_paid event
+    │   │
+    │   ├── cancel_bounty()
+    │   │   ├── Validates creator auth
+    │   │   ├── Sets status to "cancelled"
+    │   │   └── Emits bounty_cancelled event
+    │   │
+    │   └── expire_bounty()
+    │       ├── Validates caller auth (permissionless)
+    │       ├── Checks deadline has passed
+    │       ├── Sets status to "cancelled"
+    │       └── Emits bounty_expired event
     │
-    ├── claim_bounty()
-    │   ├── Validates contributor auth
-    │   ├── Assigns contributor to bounty
-    │   └── Emits bounty_claimed event
-    │
-    ├── complete_bounty()
-    │   ├── Validates verifier auth
-    │   ├── Transfers tokens via TokenClient
-    │   ├── Updates contributor reputation
-    │   ├── Emits bounty_completed event
-    │   └── Emits reward_paid event
-    │
-    ├── cancel_bounty()
-    │   ├── Validates creator auth
-    │   ├── Sets status to "cancelled"
-    │   └── Emits bounty_cancelled event
-    │
-    └── expire_bounty()
-        ├── Validates caller auth (permissionless)
-        ├── Checks deadline has passed
-        ├── Sets status to "cancelled"
-        └── Emits bounty_expired event
+    └── queries.rs
+        └── get_bounty(), get_contributor(), get_bounty_count(),
+            get_bounties_by_status(), get_status_count(),
+            get_open_bounties(), get_bounties_by_tag(), ... (read-only,
+            no auth, no storage writes)
 ```
 
 ## Storage Layout
@@ -65,9 +123,10 @@ MergeMintContract
 | `open` | Bounty is available for contributors to claim. |
 | `in_progress` | A contributor has claimed the bounty and is working on it. |
 | `completed` | The bounty has been verified and the reward has been paid out. |
-| `cancelled` | The bounty was cancelled by its creator, or expired after its deadline passed. |
+| `disputed` | The creator or an assignee raised a dispute. Only `resolve_dispute` can move it on. |
+| `cancelled` | The bounty was cancelled by its creator, expired after its deadline passed, or a dispute was resolved with `"cancel"`. |
 
-> **Note:** `disputed` is a planned future state for contested completions. It is not yet implemented.
+> **Note:** the ASCII diagram below predates `disputed`. See [Lifecycle Diagram (Mermaid)](#lifecycle-diagram-mermaid) for the complete machine, including dispute transitions and the error returned for every invalid transition.
 
 ---
 
@@ -97,6 +156,132 @@ MergeMintContract
          └──────│ completed │   (terminal — no transitions out)
                 └───────────┘
 ```
+
+---
+
+### Lifecycle Diagram (Mermaid)
+
+The diagram below is the single source of truth for which status transitions
+the contract accepts. Solid arrows are the **valid** transitions, labelled with
+the entry point that performs them. The note beside each state lists every
+**invalid** transition attempted from that state and the `ContractError` it
+fails with. The panic message for each error is in
+[Guard Failure Messages](#guard-failure-messages) below.
+
+It is derived from the guards in `src/contract/mutations.rs`, and the error
+names match `src/errors.rs`.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+
+    [*] --> open : create_bounty
+
+    open --> in_progress : claim_bounty
+    in_progress --> in_progress : claim_bounty (multi-assignee, capacity left)
+    open --> cancelled : cancel_bounty (creator)
+    open --> cancelled : expire_bounty (deadline passed)
+    open --> disputed : raise_dispute (creator)
+
+    in_progress --> completed : complete_bounty
+    in_progress --> completed : approve_completion (threshold reached)
+    in_progress --> disputed : raise_dispute (creator or assignee)
+
+    disputed --> completed : resolve_dispute "complete"
+    disputed --> cancelled : resolve_dispute "cancel"
+
+    completed --> [*]
+    cancelled --> [*]
+
+    note right of open
+        complete_bounty → BountyNotInProgress
+        complete_milestone → BountyNotInProgress
+        approve_completion → BountyHasNoAssignee
+        resolve_dispute → BountyNotDisputed
+    end note
+
+    note right of in_progress
+        claim_bounty (at capacity) → BountyAlreadyAssigned
+        claim_bounty (same contributor) → AlreadyClaimed
+        cancel_bounty → BountyNotOpen
+        expire_bounty → BountyNotOpen
+        resolve_dispute → BountyNotDisputed
+    end note
+
+    note right of disputed
+        claim_bounty → BountyNotOpen
+        complete_bounty → BountyIsDisputed
+        complete_milestone → BountyNotInProgress
+        raise_dispute → BountyIsDisputed
+        cancel_bounty → BountyNotOpen
+        expire_bounty → BountyNotOpen
+    end note
+
+    note right of completed
+        claim_bounty → BountyNotOpen
+        complete_bounty → BountyNotInProgress
+        complete_milestone → BountyNotInProgress
+        raise_dispute → BountyNotDisputed
+        resolve_dispute → BountyNotDisputed
+        cancel_bounty → BountyNotOpen
+        expire_bounty → BountyNotOpen
+    end note
+
+    note right of cancelled
+        claim_bounty → BountyNotOpen
+        complete_bounty → BountyNotInProgress
+        complete_milestone → BountyNotInProgress
+        raise_dispute → BountyNotDisputed
+        resolve_dispute → BountyNotDisputed
+        cancel_bounty → BountyNotOpen
+        expire_bounty → BountyNotOpen
+    end note
+```
+
+#### Invalid transition reference
+
+The same information as a table. Each cell is the error returned when the
+entry point in that row is called on a bounty in that column's status. ✅ means
+the call is accepted, subject to the non-status guards listed under
+[Transition Reference Table](#transition-reference-table).
+
+| Entry point | `open` | `in_progress` | `disputed` | `completed` | `cancelled` |
+|---|---|---|---|---|---|
+| `claim_bounty` | ✅ | ✅ if `assignees.len() < max_assignees`, else `BountyAlreadyAssigned` | `BountyNotOpen` | `BountyNotOpen` | `BountyNotOpen` |
+| `complete_bounty` | `BountyNotInProgress` | ✅ | `BountyIsDisputed` | `BountyNotInProgress` | `BountyNotInProgress` |
+| `complete_milestone` ¹ | `BountyNotInProgress` | ✅ | `BountyNotInProgress` | `BountyNotInProgress` | `BountyNotInProgress` |
+| `approve_completion` ² | `BountyHasNoAssignee` | ✅ | ⚠️ no status guard | ⚠️ no status guard | ⚠️ no status guard |
+| `raise_dispute` | ✅ | ✅ | `BountyIsDisputed` | `BountyNotDisputed` ³ | `BountyNotDisputed` ³ |
+| `resolve_dispute` | `BountyNotDisputed` | `BountyNotDisputed` | ✅ | `BountyNotDisputed` | `BountyNotDisputed` |
+| `cancel_bounty` | ✅ | `BountyNotOpen` | `BountyNotOpen` | `BountyNotOpen` | `BountyNotOpen` |
+| `expire_bounty` | ✅ | `BountyNotOpen` | `BountyNotOpen` | `BountyNotOpen` | `BountyNotOpen` |
+
+Notes:
+
+1. `complete_milestone` never changes `status`. It only marks one milestone
+   paid. It is listed because it is gated on `in_progress`.
+2. `approve_completion` has **no explicit status guard**. When
+   `required_verifiers` is `None` it delegates to the same check as
+   `complete_bounty` and fails with `BountyNotInProgress` outside
+   `in_progress`. When `required_verifiers` is set, it only checks that there
+   are assignees, that the verifier is on the list (`VerifierNotAuthorized`),
+   and that they have not voted yet (`AlreadyApproved`). It can therefore
+   reach the completion branch from `disputed`, `completed`, or a `cancelled`
+   bounty that still has assignees. This is tracked as a known gap in
+   [threat-model.md](threat-model.md).
+3. `raise_dispute` on a terminal bounty reuses `BountyNotDisputed`
+   (`"bounty is not in disputed status"`). The message is misleading for this
+   case, but it is the error the contract returns today.
+
+Guard order also matters. When several guards fail at once, the first one
+evaluated wins:
+
+- `claim_bounty`: `BountyNotFound` → `AlreadyClaimed` → status (`BountyNotOpen`) → `CreatorCannotClaim` → `BountyAlreadyAssigned` → `ContributorHasActiveClaim` → `BountyDeadlinePassed` → `ReputationTooLow`.
+- `complete_bounty`: `BountyNotFound` → `BountyIsDisputed` → `BountyNotInProgress` → `BountyHasNoAssignee` → `VerifierCannotBeAssignee` (→ `NotAllMilestonesCompleted` for milestone bounties).
+- `raise_dispute`: `BountyNotFound` → `BountyIsDisputed` → `BountyNotDisputed` → `OnlyCreatorOrAssigneeCanDispute`.
+- `resolve_dispute`: `BountyNotFound` → `BountyNotDisputed` → `NotArbitrator` → `InvalidResolution` → `ReputationTooLow` → `BountyHasNoAssignee` / `NotAllMilestonesCompleted` (on `"complete"`).
+- `cancel_bounty`: `BountyNotFound` → `NotBountyCreator` → `BountyNotOpen`. A non-creator gets `NotBountyCreator` whatever the status is.
+- `expire_bounty`: `BountyNotFound` → `BountyNoDeadline` → `DeadlineNotPassed` → `BountyNotOpen`.
 
 ---
 
@@ -137,8 +322,8 @@ Valid exits:
 - → `completed` via `complete_bounty` (verifier with funds, assignee must exist)
 
 Invalid transitions (will panic):
-- `cancel_bounty` on an `in_progress` bounty → panics `"bounty is not open"`
-- `expire_bounty` on an `in_progress` bounty → panics `"bounty is not open"`
+- `cancel_bounty` on an `in_progress` bounty → panics `"bounty not open"`
+- `expire_bounty` on an `in_progress` bounty → panics `"bounty not open"`
 - `claim_bounty` again → panics `"bounty already assigned"`
 
 ---
@@ -179,15 +364,88 @@ The two paths into `cancelled` emit different events to let off-chain indexers d
 
 ### Guard Failure Messages
 
-| Guard | Panic message |
-|-------|---------------|
-| Bounty does not exist | `"bounty not found"` |
-| Bounty already has an assignee | `"bounty already assigned"` |
-| Bounty has no assignee | `"bounty has no assignee"` |
-| Caller is not the bounty creator | `"not the bounty creator"` |
-| Bounty is not in `open` state | `"bounty is not open"` |
-| Bounty has no deadline set | `"bounty has no deadline"` |
-| Deadline has not yet passed | `"bounty deadline has not passed"` |
+Messages are taken verbatim from `errors::message` in `src/errors.rs`.
+
+| Guard | `ContractError` | Panic message |
+|-------|-----------------|---------------|
+| Bounty does not exist | `BountyNotFound` | `"bounty not found"` |
+| Bounty is at `max_assignees` capacity | `BountyAlreadyAssigned` | `"bounty already assigned"` |
+| Contributor already assigned to this bounty | `AlreadyClaimed` | `"bounty already claimed by contributor"` |
+| Bounty has no assignee | `BountyHasNoAssignee` | `"bounty has no assignee"` |
+| Caller is not the bounty creator | `NotBountyCreator` | `"not bounty creator"` |
+| Bounty is not in a claimable / cancellable state | `BountyNotOpen` | `"bounty not open"` |
+| Bounty is not `in_progress` | `BountyNotInProgress` | `"bounty is not in progress"` |
+| Bounty is `disputed` | `BountyIsDisputed` | `"bounty is disputed"` |
+| Bounty is not `disputed` (or cannot be disputed) | `BountyNotDisputed` | `"bounty is not in disputed status"` |
+| Bounty has no deadline set | `BountyNoDeadline` | `"bounty has no deadline"` |
+| Deadline has not yet passed | `DeadlineNotPassed` | `"deadline has not passed"` |
+| Deadline has passed (claim) | `BountyDeadlinePassed` | `"bounty deadline passed"` |
+
+---
+
+## Solidity / Soroban Lifecycle Parity
+
+This section reconciles the two contracts named in issue #713 — the Solidity
+`BountyRefresh` contract (`contracts/bounty/BountyRefresh.sol`) and the Soroban
+`MergeMintContract` (`src/contract/`) — to confirm whether their bounty-lifecycle
+status transitions match, and to record any intentional divergence.
+
+### Finding: one bounty-lifecycle state machine, two different operational models
+
+Soroban is the **only** place a bounty's lifecycle `status` field is defined and
+transitioned. Its state machine (`open → in_progress → completed | cancelled`, plus
+the `disputed` sub-state) is the canonical bounty lifecycle and is documented in the
+previous section.
+
+The Solidity `BountyRefresh` contract does **not** model a bounty lifecycle at all.
+Its state is a batch/refresh *orchestration* model, scoped to re-computing contributor
+metrics in bulk. It never reads or writes a bounty `status`; it has no `open`,
+`in_progress`, `completed`, `cancelled`, or `disputed` bounty state and no transition
+functions resembling `claim_bounty` / `complete_bounty` / `cancel_bounty` /
+`expire_bounty`. `IBountyManager.sol` likewise exposes only
+`updateContributorMetrics`, `getBountyContributors`, and `getContributorCount`.
+
+This separation is **intentional**: `BountyRefresh` is an off-path operational tool
+for refreshing contributor metrics, not a second implementation of the bounty
+lifecycle. There is therefore no lifecycle to "keep in parity" beyond the Soroban
+machine.
+
+### State-model comparison
+
+| Concern | Solidity `BountyRefresh.sol` | Soroban `MergeMintContract` |
+|---------|------------------------------|-----------------------------|
+| What is modelled | Refresh task / batch run progress | Bounty lifecycle `status` |
+| States | `BountyRefreshTask.completed`, `BountyRefreshTask.failed`; `RefreshBatch.isProcessing`, `RefreshBatch.isCompleted`; `Pausable` | `open`, `in_progress`, `completed`, `cancelled`, `disputed` |
+| Transitions on | `createBatch` → `processBatchParallel` → `finalizeBatch` | `create_bounty` → `claim_bounty` → `complete_bounty` / `cancel_bounty` / `expire_bounty` / `raise_dispute` |
+| Touches bounty `status`? | No | Yes |
+| Auth model | `onlyOwner` + `nonReentrant` + `whenNotPaused` | `require_auth()` per role (creator / contributor / verifier) |
+
+### Lexical overlap with divergent meaning (documented so reviewers don't conflate them)
+
+The token `completed` appears in both contracts but means different things:
+
+- In Soroban, `completed` is a **terminal bounty state**: the reward was paid and
+  reputation updated; no transitions out.
+- In `BountyRefresh`, `RefreshBatch.isCompleted` (and `BountyRefreshTask.completed`)
+  means the **refresh run finished** (success or failure counted), independent of any
+  bounty status. It is an operational flag, not a bounty lifecycle state.
+
+Because the two `completed` values live in unrelated structs and are never bridged,
+there is no shared transition to keep consistent.
+
+### `disputed` state
+
+`disputed` is implemented in Soroban via `raise_dispute` / `resolve_dispute`
+(`src/contract/mutations.rs`). It has no counterpart and no relevance in
+`BountyRefresh`, which has no bounty-lifecycle states to dispute. This is expected
+given the contracts model different concerns.
+
+### Recommended follow-up (out of scope for this PR)
+
+If a future change introduces bounty-lifecycle logic into the Solidity side (e.g. a
+real `BountyManager` that mutates bounty `status`), that is the point at which the two
+state machines must be reconciled for parity. Until then, parity is satisfied by the
+single-sourced Soroban machine.
 
 ---
 
@@ -251,3 +509,65 @@ The following entries are covered:
 | `DataKey::OpenBounties` | `get_open_bounties`, `set_open_bounties` |
 
 `DataKey::BountyMeta` uses **temporary** storage (metadata is only needed during the bounty creation window) and does not require TTL extension.
+
+---
+
+## Solidity / Soroban Bounty Lifecycle Parity
+
+This section compares the bounty state machine modeled by the Soroban
+contract (`src/contract/`, documented above) against the state machine
+modeled by the Solidity contract `contracts/bounty/BountyRefresh.sol`, and
+records why they intentionally diverge.
+
+### Summary
+
+**They are not the same state machine, and are not meant to be.** The
+Soroban contract owns the canonical bounty lifecycle (`open` →
+`in_progress` → `completed` / `cancelled`). `BountyRefresh.sol` does not
+read or write that lifecycle at all — it manages an orthogonal, secondary
+lifecycle for **batching and retrying contributor-metrics refresh work**
+against an `IBountyManager` implementation. A bounty's core status field is
+never touched by anything in `BountyRefresh.sol`.
+
+### Side-by-side state comparison
+
+| | Soroban (`src/contract/`) | Solidity (`BountyRefresh.sol`) |
+|---|---|---|
+| What the states represent | Lifecycle of a single bounty | Lifecycle of a refresh **task**/**batch** operation |
+| States | `open`, `in_progress`, `completed`, `cancelled` | Task: pending → `completed` \| `failed`. Batch: created → `isProcessing` → `isCompleted` |
+| Terminal states | `completed`, `cancelled` | Task: `completed` or `failed` (both terminal). Batch: `isCompleted` |
+| Who triggers transitions | Creator, contributor, verifier, or any caller (for `expire_bounty`) | Contract owner only (`onlyOwner` on every state-changing entry point) |
+| Re-entrant transitions allowed? | No — each function guards against re-entering its own precondition (e.g. "bounty already assigned") | No — `processBatchParallel` uses `nonReentrant` and batch/task completion flags are one-way |
+| Failure handling | Guards `require`/panic before any state mutation; no partial-failure state | Per-task `try/catch` records `failed` + `errorMessage` without reverting the whole batch |
+| Persistence | Bounty struct keyed by `bounty_{id}` in Soroban persistent storage, subject to TTL extension | Task/batch structs keyed by `taskCounter`/`batchCounter` in EVM contract storage (no TTL concept) |
+
+### Why the divergence is intentional
+
+- **Different problem domains.** The Soroban contract is the source of
+  truth for "what state is this bounty in from the product's perspective."
+  `BountyRefresh.sol` exists purely to amortize the cost of pushing
+  contributor metric updates to an `IBountyManager` implementation in
+  batches, and to make that work resumable/parallelizable. It has no
+  concept of "open" or "claimed" — it only knows "this contributor's
+  metrics need a refresh" and "did that refresh succeed or fail."
+- **Different failure semantics on purpose.** The Soroban lifecycle treats
+  an invalid transition as a hard panic (nothing should ever observe a
+  bounty in an inconsistent state). `BountyRefresh.sol`'s task lifecycle
+  treats an individual refresh failure as data (`TaskFailed`) rather than a
+  revert, because one contributor's metrics update failing should not block
+  the rest of the batch.
+- **Different authorization models on purpose.** Every bounty-lifecycle
+  transition in Soroban is driven by the relevant party's own
+  `require_auth()` (creator, contributor, verifier, or anyone for the
+  permissionless `expire_bounty`). Every state-changing entry point in
+  `BountyRefresh.sol` is restricted to the contract owner, because refresh
+  batching is an operational/maintenance action, not a bounty-participant
+  action.
+
+### Follow-up
+
+No behavioral changes are proposed here. If a future requirement ties
+`BountyRefresh.sol` batch outcomes back into the Soroban bounty status
+(e.g. auto-flagging a bounty when metric refresh repeatedly fails), that
+should be scoped as its own issue rather than folded into this
+documentation pass.

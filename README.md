@@ -1,50 +1,20 @@
-# MergeMint
+# Batch and Parallel Contributor Refresh
 
-MergeMint is an open-source bounty platform on [Stellar](https://stellar.org). Maintainers post
-bounties for issues and escrow the reward on-chain. Contributors claim the bounties, and a verifier
-approves the work, which releases the payout and builds the contributor's on-chain reputation.
+[![codecov](https://codecov.io/gh/mergemint-mint/mergemint-contracts/branch/main/graph/badge.svg)](https://codecov.io/gh/mergemint-mint/mergemint-contracts)
 
-This repository is a monorepo containing:
+This implementation provides production-ready code for batching and parallelizing contributor refresh operations in the `refresh_bounty` function.
 
-- the **Soroban smart contract**, the source of truth for bounties, escrow, disputes and reputation
-- an **indexer + API backend** that mirrors contract events into a queryable store and builds transactions
-- **web frontends** and a **TypeScript SDK** for talking to the contract
+## Overview
 
-## Architecture
+The solution consists of:
 
-```mermaid
-flowchart LR
-    user([Maintainer / Contributor])
+1. **Smart Contract** (`BountyRefresh.sol`): Handles batch creation, parallel processing, and task management
+2. **Batch Manager** (`batchRefresh.js`): JavaScript utility for managing batch operations
+3. **Comprehensive Tests** (`BountyRefresh.test.js`): Full test coverage
 
-    subgraph client [Client]
-        fe["frontend/ · mergemint-frontend/<br/>React + Vite web app"]
-        app["app/<br/>shared form components"]
-        sdk["sdk/<br/>@mergemint/sdk"]
-    end
+## Key Features
 
-    subgraph stellar [Stellar network]
-        rpc[(Soroban RPC / Horizon)]
-        contract["Soroban contract<br/>(repo root: src/)"]
-    end
-
-    subgraph backendsvc [Backend]
-        indexer["Indexer<br/>polls contract events"]
-        api["mergemint-backend/<br/>Axum REST + SSE API"]
-        db[(Database)]
-        health["backend/<br/>health checks"]
-    end
-
-    user --> fe
-    fe --- app
-    fe -->|reads, SSE updates, tx building| api
-    fe -->|sign & submit via wallet| sdk
-    sdk --> rpc
-    rpc --> contract
-    indexer -->|getEvents| rpc
-    indexer --> db
-    api --> db
-    health -.->|indexer lag, DB, network| api
-```
+### Batch Processing
 
 1. **Writes** (create, claim, complete, dispute) are Soroban contract invocations. The frontend
    uses the SDK (or XDR built by the backend's `/tx/*` routes), and the user signs with their
@@ -104,7 +74,35 @@ cargo run            # listens on http://localhost:8080
 cargo test
 ```
 
-### Frontend and SDK
+## API Reference
+
+### Contract Functions
+
+#### `createBatch(address[] contributors, uint256[] bountyIds)`
+
+Creates a new batch for processing.
+
+- **Parameters**:
+  - `contributors`: Array of contributor addresses
+  - `bountyIds`: Array of corresponding bounty IDs
+- **Returns**: Batch ID
+- **Events**: `BatchCreated`
+
+#### `processBatchParallel(uint256 batchId)`
+
+Processes a batch with parallel execution.
+
+- **Parameters**:
+  - `batchId`: ID of the batch to process
+- **Events**: `ParallelRefreshStarted`, `TaskCompleted`, `TaskFailed`, `TaskRetried`
+
+#### `finalizeBatch(uint256 batchId)`
+
+Finalizes batch processing.
+
+- **Parameters**:
+  - `batchId`: ID of the batch to finalize
+- **Events**: `BatchProcessingCompleted`
 
 ```bash
 npm install                  # root workspace + lint tooling
