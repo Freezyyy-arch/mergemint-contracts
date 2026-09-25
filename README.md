@@ -1,5 +1,7 @@
 # Batch and Parallel Contributor Refresh
 
+[![codecov](https://codecov.io/gh/mergemint-mint/mergemint-contracts/branch/main/graph/badge.svg)](https://codecov.io/gh/mergemint-mint/mergemint-contracts)
+
 This implementation provides production-ready code for batching and parallelizing contributor refresh operations in the `refresh_bounty` function.
 
 ## Overview
@@ -83,7 +85,7 @@ Processes a batch with parallel execution.
 
 - **Parameters**:
   - `batchId`: ID of the batch to process
-- **Events**: `ParallelRefreshStarted`, `TaskCompleted`, `TaskFailed`
+- **Events**: `ParallelRefreshStarted`, `TaskCompleted`, `TaskFailed`, `TaskRetried`
 
 #### `finalizeBatch(uint256 batchId)`
 
